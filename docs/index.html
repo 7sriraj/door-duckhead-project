@@ -1,0 +1,533 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Volume Tracking</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three/examples/js/loaders/GLTFLoader.js"></script>
+    <!-- stats -->
+    <script src="https://cdn.jsdelivr.net/npm/three/examples/js/libs/stats.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/kalmanjs@1.1.0/lib/kalman.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/materialize/1.0.0/css/materialize.min.css">
+
+    <!-- Compiled and minified JavaScript -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/materialize/1.0.0/js/materialize.min.js"></script>
+
+    <style>
+        body {
+            font-family: 'Courier New', Courier, monospace;
+            margin: 20px;
+            background-color: black;
+            color: white;
+        }
+
+        #output {
+            white-space: pre-wrap;
+            background: transparent;
+            padding: 10px;
+            border: none;
+            height: 20px;
+            max-width: 500px;
+            overflow-y: visible;
+        }
+
+        button {
+            margin: 5px 0;
+            padding: 10px;
+            font-family: 'Courier New', Courier, monospace;
+            padding: 10px 20px;
+            font-weight: bold;
+            font-size: 20px;
+            border-radius: 20px;
+        }
+
+        canvas {
+            position: absolute;
+            top: 0;
+            z-index: -2;
+        }
+
+        input {
+            color: white;
+            font-family: 'Courier New', Courier, monospace;
+        }
+    </style>
+</head>
+
+<body>
+
+    <div class="row" style="margin-top: -10px;">
+        <div class="col s4">
+            <h3>Volume Tracking</h3>
+        </div>
+        <div class="col s1">
+            <label for="anchorDist">Stage (m)</label>
+            <input id="anchorDist" onchange="anchorDist = parseInt(this.value)" type="number" step=".1"
+                placeholder="Anchor Distance" value="10" min="1" max="100">
+        </div>
+        <div class="col s4">
+            <label for="wsurl">WebSocket URL</label>
+            <input onchange="wsurl = this.value; wsChanged()" id="wsurl" type="url" placeholder="WebSocket URL"
+                value="ws://localhost:8080">
+        </div>
+        <div class="col s1">
+            <label for="fps">FPS</label>
+            <input id="fps" onchange="wsfps = parseInt(this.value);wsChanged()" type="number" placeholder="FPS" step=1
+                value="30" min="1" max="120">
+        </div>
+        <div class="col s1" style="width: 100px;">
+            <label>
+                <label for="wsEnable">Enable</label>
+                <input id="wsEnable" onchange="wson = this.checked" type="checkbox" checked>
+                <span style="margin-top: 12px;margin-left:12px"></span>
+            </label>
+        </div>
+    </div>
+    <button id="connect">Connect to Serial Device</button>
+    <button id="disconnect" disabled>Disconnect</button>
+    <button id="calibrate" disabled>Calibrate</button>
+    <div id="output"></div>
+
+    <script>
+        var wsconnect = false;
+        var wsurl = document.getElementById("wsurl").value;
+        var wsfps = document.getElementById("fps").value;
+        var wsIntProcess = null;
+        var ws;
+        var wson = true;
+        var anchorDist = 10;
+
+
+
+        wsurl = localStorage.getItem("wsurl") || "ws://localhost:8080";
+        wsfps = localStorage.getItem("wsfps") || 30;
+        document.getElementById("wsurl").value = wsurl;
+        document.getElementById("fps").value = wsfps;
+
+
+
+        function wsChanged() {
+            localStorage.setItem("wsurl", wsurl);
+            localStorage.setItem("wsfps", wsfps);
+
+            // stop start ws process
+            if (wsIntProcess) {
+                clearInterval(wsIntProcess);
+            }
+            window.startwsProcess();
+        }
+
+
+    </script>
+    <script type="module">
+
+        // kalman with process noise 0.1 and measurement noise 0.1
+        var kA1 = new KalmanFilter({ R: 0.5, Q: 0.5 });
+        var kA2 = new KalmanFilter({ R: 0.5, Q: 0.5 });
+
+        var hkA1 = new KalmanFilter({ R: 0.1, Q: 0.1 });
+        var hkA2 = new KalmanFilter({ R: 0.1, Q: 0.1 });
+
+        var kT1x = new KalmanFilter({ R: 0.1, Q: 0.1 });
+        var kT1y = new KalmanFilter({ R: 0.1, Q: 0.1 });
+
+        var kT2x = new KalmanFilter({ R: 0.1, Q: 0.1 });
+        var kT2y = new KalmanFilter({ R: 0.1, Q: 0.1 });
+
+        let port;
+        let reader;
+        let keepReading = true;
+
+        const connectButton = document.getElementById('connect');
+        const disconnectButton = document.getElementById('disconnect');
+        const calibrateButton = document.getElementById('calibrate');
+        const outputDiv = document.getElementById('output');
+
+        connectButton.addEventListener('click', async () => {
+            try {
+                // Request a port and open a connection
+                port = await navigator.serial.requestPort();
+                await port.open({ baudRate: 115200 });
+
+                // Enable disconnect button
+                disconnectButton.disabled = false;
+                connectButton.disabled = true;
+                calibrateButton.disabled = false;
+
+                // Start reading data
+                const decoder = new TextDecoderStream();
+                const inputDone = port.readable.pipeTo(decoder.writable);
+                const inputStream = decoder.readable;
+                reader = inputStream.getReader();
+
+                outputDiv.textContent += 'Connected to serial device.\n';
+
+                while (keepReading) {
+                    const { value, done } = await reader.read();
+                    if (done) {
+                        break; // Exit the loop if the reader is closed
+                    }
+                    if (value) {
+                        // outputDiv.textContent += value;
+                        // outputDiv.scrollTop = outputDiv.scrollHeight; // Auto-scroll to the bottom
+                        handleData(value);
+                    }
+                }
+            } catch (error) {
+                console.error('Error:', error);
+                outputDiv.textContent += `Error: ${error.message}\n`;
+            }
+        });
+
+        disconnectButton.addEventListener('click', async () => {
+            window.location.reload();
+            keepReading = false;
+
+            if (reader) {
+                await reader.cancel();
+                reader.releaseLock();
+            }
+
+            if (port) {
+                await port.close();
+            }
+
+            outputDiv.textContent += 'Disconnected from serial device.\n';
+            disconnectButton.disabled = true;
+            connectButton.disabled = false;
+        });
+
+
+
+        var T1wx = 0;
+        var T1wy = 0;
+        var T1wz = 0;
+        var T1ww = 1;
+        var T2wx = 0;
+        var T2wy = 0;
+        var T2wz = 0;
+        var T2ww = 1;
+
+        calibrateButton.addEventListener('click', async () => {
+            // Get the current position and rotation of the trackers
+            if (window.tracker1) {
+                T1wx = window.tracker1.quaternion.x;
+                T1wy = window.tracker1.quaternion.y;
+                T1wz = window.tracker1.quaternion.z;
+                T1ww = window.tracker1.quaternion.w;
+            }
+            if (window.tracker2) {
+                T2wx = window.tracker2.quaternion.x;
+                T2wy = window.tracker2.quaternion.y;
+                T2wz = window.tracker2.quaternion.z;
+                T2ww = window.tracker2.quaternion.w;
+            }
+            M.toast({
+                html: 'Calibration done!',
+                classes: 'rounded white black-text',
+                displayLength: 2000,
+                completeCallback: function () {
+                    console.log('Calibration done!');
+                }
+            });
+        });
+
+
+        let buffer = ""; // Buffer to store incomplete data
+
+        function handleData(data) {
+            stats.update();
+
+            // Append the incoming data to the buffer
+            buffer += data;
+
+            // Split the buffer into lines based on the newline character
+            var lines = buffer.split("\n");
+
+            // Process all complete lines except the last one (it may be incomplete)
+            for (let i = 0; i < lines.length - 1; i++) {
+                var line = lines[i].trim(); // Trim whitespace
+                if (line) {
+                    // line = line.replace("[0] get Text: ", "");
+                    // console.log(line);
+                    try {
+                        outputDiv.textContent = line;
+                        var json = JSON.parse(line);
+                        setPosition(json);
+                    }
+                    catch (e) {
+                        console.log("Error parsing JSON: ", e);
+                    }
+                }
+            }
+
+            // Keep the last (incomplete) line in the buffer
+            buffer = lines[lines.length - 1];
+        }
+
+
+        function getTagDistance(a, b, c) {
+            var x = (a * a - b * b + c * c) / (2 * c);
+            var y = Math.sqrt(a * a - x * x);
+            // handle NaN
+            if (isNaN(y)) {
+                y = 0;
+            }
+
+            x = map(x, 0, c, 0, 44);
+            y = map(y, 0, c, 0, 24);
+            return [x, y];
+        }
+
+        function map(value, in_min, in_max, out_min, out_max) {
+            return (value - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
+        }
+
+        var hA1Dist = 0;
+        var hA2Dist = 0;
+
+        function setPosition(json) {
+            // if json has device key
+            if (json.device) {
+               if(json.device == "90:38:0C:B4:8C:38") {
+                    hA1Dist = parseFloat(json.distance);
+                }
+                else if(json.device == "90:38:0C:B4:8A:CC") {
+                    hA2Dist = parseFloat(json.distance);
+                }
+                
+            }
+            if (json.pod == "Tracker2") {
+                var a1dist = kA1.filter(json.a1);
+                var a2dist = kA2.filter(json.a2);
+                //console.log("Anchor Distances:", a1dist, a2dist);
+                var tP = getTagDistance(a1dist, a2dist, anchorDist);
+                //console.log("Tracker Position:", tP)
+
+                //window.tracker2.position.set(kT2x.filter(tP[0]), 4, kT2y.filter(tP[1]));
+                
+                window.tracker2.position.lerp(
+                    new THREE.Vector3(kT1x.filter(tP[0]), 4, kT1y.filter(tP[1])),
+                    0.2
+                );
+                
+                var u = new THREE.Quaternion(T2wx, T2wy, T2wz, T2ww).invert();
+                var finalQ = new THREE.Quaternion(json.x, json.y, json.z, json.w).multiply(
+                    new THREE.Quaternion(u.x, u.y, u.z, u.w)
+                );
+                window.tracker2.quaternion.set(-finalQ.y, finalQ.z, -finalQ.x, finalQ.w);
+            }
+            else if (json.pod == "Tracker1") {
+                /*
+                var a1dist = hkA1.filter(hA1Dist);
+                var a2dist = hkA2.filter(hA2Dist);
+
+
+                console.log("Anchor Distances:", a1dist, a2dist);
+
+                var tP = getTagDistance(a1dist, a2dist, anchorDist);
+                //console.log("Tracker Position:", tP)
+
+                window.tracker1.position.lerp(
+                    new THREE.Vector3(kT1x.filter(tP[0]), 4, kT1y.filter(tP[1])),
+                    0.2
+                );
+*/
+                var u = new THREE.Quaternion(T1wx, T1wy, T1wz, T1ww).invert();
+                var finalQ = new THREE.Quaternion(json.x, json.y, json.z, json.w).multiply(
+                    new THREE.Quaternion(u.x, u.y, u.z, u.w)
+                );
+                window.tracker1.quaternion.set(-finalQ.y, finalQ.z, -finalQ.x, finalQ.w);
+            }
+
+        }
+
+        import * as THREE from 'https://cdn.skypack.dev/three@0.136.0';
+        import { GLTFLoader } from 'https://cdn.skypack.dev/three@0.136.0/examples/jsm/loaders/GLTFLoader.js';
+        import { OrbitControls } from 'https://cdn.skypack.dev/three@0.136.0/examples/jsm/controls/OrbitControls.js';
+
+        const renderer = new THREE.WebGLRenderer();
+        const scene = new THREE.Scene();
+        const camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight);
+        let mesh;
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.25;
+
+
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        scene.background = new THREE.Color(0x000000);
+        scene.add(new THREE.HemisphereLight(0xffffcc, 0x333399, 1.0));
+        camera.position.set(50, 100, 200);
+        // scale scene
+        scene.scale.set(2.4, 2.4, 2.4);
+
+        new GLTFLoader().load('wall.glb', ({ scene: model }, animations) => {
+            scene.add(model);
+            model.rotation.y = Math.PI / 2;
+            model.position.set(22, 0, 0);
+            model.scale.setScalar(5.0);
+            mesh = model;
+            model.traverse((child) => {
+                if (child.isMesh) {
+                    child.castShadow = true;
+                    child.receiveShadow = true;
+                }
+            });
+        });
+
+        // add headphones.glb as tracker1
+        const loader = new GLTFLoader();
+        loader.load('headphones.glb', (gltf) => {
+            window.tracker1 = gltf.scene;
+            window.tracker1.position.set(18, 4, 8);
+            window.tracker1.scale.set(10, 10, 10);
+            // set red color
+            window.tracker1.traverse((child) => {
+                if (child.isMesh) {
+                    // bright pink color
+                    child.material.color.set(0xff00ff);
+                    // cast shadow
+                    child.castShadow = true;
+                    child.receiveShadow = true;
+                }
+            });
+            scene.add(window.tracker1);
+        });
+        loader.load('headphones.glb', (gltf) => {
+            window.tracker2 = gltf.scene;
+            window.tracker2.position.set(26, 4, 8);
+            window.tracker2.scale.set(10, 10, 10);
+            // set blue color
+            window.tracker2.traverse((child) => {
+                if (child.isMesh) {
+                    child.material.color.set(0x7fffd4);
+                    // cast shadow
+                    child.castShadow = true;
+                    child.receiveShadow = true;
+                }
+            });
+            scene.add(window.tracker2);
+        });
+
+
+        // add cube
+        const geometry = new THREE.BoxGeometry(2, 4, 2);
+        const material = new THREE.MeshBasicMaterial({ color: 0xff0000 });
+        const material2 = new THREE.MeshBasicMaterial({ color: 0x00ff00 })
+        window.anchor1 = new THREE.Mesh(geometry, material2);
+        window.anchor1.position.set(44, 2, 0);
+        scene.add(window.anchor1);
+
+        window.anchor2 = new THREE.Mesh(geometry, material2);
+        window.anchor2.position.set(0, 2, 0);
+        scene.add(window.anchor2);
+
+
+
+
+        // add axes helper
+        //const axesHelper = new THREE.AxesHelper(5);
+        //scene.add(axesHelper);
+
+        const animate = () => {
+            renderer.render(scene, camera);
+            controls.update();
+            requestAnimationFrame(animate);
+        };
+
+        animate();
+
+        document.body.appendChild(renderer.domElement);
+
+        // add stats
+        const stats = new Stats();
+        stats.showPanel(0); // 0: fps, 1: ms, 2: memory
+        // put stats in the top right corner
+
+        stats.dom.style.position = 'absolute';
+        stats.dom.style.bottom = '0px';
+        stats.dom.style.left = 'calc(100vw - 80px)';
+        document.body.appendChild(stats.dom);
+
+        function connectws() {
+            ws = new WebSocket(wsurl);
+            ws.onopen = function () {
+                wsconnect = true;
+                // subscribe to some channels
+                ws.send(JSON.stringify({
+                    //.... some message the I must send when I connect ....
+                }));
+            };
+
+            ws.onmessage = function (e) {
+                console.log('Message:', e.data);
+            };
+
+            ws.onclose = function (e) {
+                wsconnect = false;
+                //console.log('Socket is closed. Reconnect will be attempted in 1 second.', e.reason);
+                setTimeout(function () {
+                    connectws();
+                }, 1000);
+            };
+
+            ws.onerror = function (err) {
+                //console.error('Socket encountered error: ', err.message, 'Closing socket');
+                ws.close();
+            };
+        }
+
+        connectws();
+
+        window.startwsProcess = function () {
+            wsIntProcess = setInterval(function () {
+                if (wsconnect && wson) {
+                    //console.log("Sending data to server");
+                    ws.send(JSON.stringify({
+                        "pod": "Tracker1",
+                        "x": window.tracker1.quaternion.x,
+                        "y": window.tracker1.quaternion.y,
+                        "z": window.tracker1.quaternion.z,
+                        "w": window.tracker1.quaternion.w,
+                        "roll": window.tracker1.rotation.x,
+                        "pitch": window.tracker1.rotation.y,
+                        "yaw": window.tracker1.rotation.z,
+                        "position": {
+                            "x": window.tracker1.position.x,
+                            "y": window.tracker1.position.y,
+                            "z": window.tracker1.position.z
+                        }
+                    }));
+                    ws.send(JSON.stringify({
+                        "pod": "Tracker2",
+                        "x": window.tracker2.quaternion.x,
+                        "y": window.tracker2.quaternion.y,
+                        "z": window.tracker2.quaternion.z,
+                        "w": window.tracker2.quaternion.w,
+                        "roll": window.tracker2.rotation.x,
+                        "pitch": window.tracker2.rotation.y,
+                        "yaw": window.tracker2.rotation.z,
+                        "position": {
+                            "x": window.tracker2.position.x,
+                            "y": window.tracker2.position.y,
+                            "z": window.tracker2.position.z
+                        }
+                    }));
+                }
+            }, 1000 / wsfps);
+
+        }
+
+        startwsProcess();
+
+    </script>
+
+    <style>
+
+    </style>
+</body>
+
+</html>
